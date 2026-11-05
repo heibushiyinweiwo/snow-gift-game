@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>雪花接礼物</title>
+<style>
+  /* ===== 页面样式：清新冬日配色，画布居中，适配电脑浏览器 ===== */
+  html, body {
+    margin: 0; padding: 0;
+    height: 100%;
+    background: linear-gradient(180deg, #cfe9f7 0%, #eaf6fd 60%, #f7fbff 100%);
+    font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    overflow: hidden;
+  }
+  #wrap {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  canvas {
+    max-width: 100vw; max-height: 100vh;
+    border-radius: 12px;
+    box-shadow: 0 10px 34px rgba(60, 110, 150, .28);
+    cursor: pointer;
+    background: #cfe9f7;
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="960" height="600"></canvas></div>
+
+<script>
+/* =========================================================================
+ * 雪花接礼物 —— 单文件 HTML + Canvas + JavaScript 小游戏
+ * 一局限时 60 秒：接礼盒加分，撞冰块扣生命，雪花只作背景装饰不参与碰撞。
+ * 所有图形均用 Canvas 2D 绘图 API 生成，不引用任何外部图片资源。
+ * ========================================================================= */
+
+/* ---------------------------------------------------------------- 基础设置 */
+const canvas = document.getElementById("game");
+const ctx    = canvas.getContext("2d");
+
+const W = 960;                 // 逻辑宽度（CSS 像素）
+const H = 600;                 // 逻辑高度
+const GROUND_Y = H - 78;       // 雪地表面 y
+const SLED_TOP = GROUND_Y - 42;// 雪橇接物区顶部 y
+
+/* 按设备像素比放大画布，让线条在高分屏上更清晰 */
+(function setupHiDPI() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = W * dpr;
+  canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);   // 之后所有绘制仍按逻辑坐标
+})();
+
+/* ---------------------------------------------------------------- 游戏状态 */
+const STATE = { START: "start", PLAY: "play", OVER: "over" };
+let state = STATE.START;
+
+const TOTAL_TIME = 60;     // 一局时长（秒）
+let timeLeft = TOTAL_TIME;
+let score    = 0;
+let lives    = 3;
+let playTime = 0;          // 本局已进行秒数（用于难度渐进）
+
+/* 实体容器 */
+let gifts    = [];         // 礼盒（接住加分）
+let ices     = [];         // 冰块（撞到扣生命）
+let sparkles = [];         // 接住礼物的闪光粒子
+let rings    = [];         // 接住礼物的扩散光环
+let flakes   = [];         // 背景雪花（无碰撞）
+
+/* 雪橇 */
+const sled = {
+  x: W / 2,                // 中心 x
+  w: 116, h: 42,           // 接物碰撞盒宽高
+  speed: 430,              // 横向速度 px/s
+  invuln: 0                // 受击后的短暂无敌时间，防止连续扣血
+};
+
+/* 特效计时 */
+let spawnTimer = 0;
+const SHAKE_DUR = 0.32;        // 撞冰抖动总时长
+let shakeTime = 0;
+const OVER_SHAKE_DUR = 3;      // 游戏结束页抖动总时长（秒）
+let overShakeTime = 0;
+
+/* 开始 / 结束页按钮的屏幕区域（点击判定用） */
+const startBtn = { x: W / 2 - 150, y: 386, w: 300, h: 64 };
+const againBtn = { x: W / 2 - 150, y: 398, w: 300, h: 62 };
+
+/* ---------------------------------------------------------------- 工具函数 */
+function rand(a, b)  { return a + Math.random() * (b - a); }
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+/* 圆角矩形路径（自行实现，避免依赖较新的 roundRect API） */
+function rr(c, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y,     x + w, y + h, r);
+  c.arcTo(x + w, y + h, x,     y + h, r);
+  c.arcTo(x,     y + h, x,     y,     r);
+  c.arcTo(x,     y,     x + w, y,     r);
+  c.closePath();
+}
+
+/* 轴对齐矩形相交检测 */
+function hit(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x &&
+         a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+/* ---------------------------------------------------------------- 背景雪花 */
+/* 初始化一批随机雪花：只做飘落动画，不参与任何碰撞 */
+function initSnow() {
+  flakes = [];
+  for (let i = 0; i < 95; i++) {
+    flakes.push({
+      x: rand(0, W), y: rand(0, H),
+      r: rand(1.0, 3.4),              // 半径越大越靠近镜头
+      vy: rand(18, 62),
+      sway: rand(0.4, 1.4),           // 左右摆动幅度
+      phase: rand(0, Math.PI * 2),    // 摆动相位
+      alpha: rand(0.45, 0.95)
+    });
+  }
+}
+
+/* ---------------------------------------------------------------- 重开一局 */
+function resetGame() {
+  score = 0; lives = 3;
+  timeLeft = TOTAL_TIME; playTime = 0;
+  gifts = []; ices = []; sparkles = []; rings = [];
+  spawnTimer = 0.35; shakeTime = 0; overShakeTime = 0;
+  sled.x = W / 2; sled.invuln = 0;
+}
+
+/* ---------------------------------------------------------------- 生成掉落物 */
+/* 礼盒约占 74%、冰块约占 26% —— 冰块数量明显少于礼盒，避免太难 */
+function spawnDrop() {
+  const isIce = Math.random() < 0.26;
+  const ramp = 1 + playTime / 90;      // 随时间轻微提速
+
+  if (isIce) {
+    const s = rand(30, 42);
+    ices.push({
+      x: rand(20, W - 20 - s), y: -50, w: s, h: s * 0.86,
+      vy: rand(85, 150) * ramp,
+      rot: rand(-0.18, 0.18)           // 轻微倾斜，更像冰块
+    });
+  } else {
+    const s = rand(30, 40);
+    gifts.push({
+      x: rand(20, W - 20 - s), y: -50, w: s, h: s * 0.88,
+      vy: rand(105, 205) * ramp,       // 礼盒下落速度随机
+      red: Math.random() < 0.5,        // 红盒或绿盒
+      wob: rand(0, Math.PI * 2)        // 摆动相位
+    });
+  }
+}
+
+/* ---------------------------------------------------------------- 特效 */
+/* 接住礼物：白色 + 金色闪光粒子 + 扩散光环 */
+function burst(x, y) {
+  for (let i = 0; i < 14; i++) {
+    const a = rand(0, Math.PI * 2), sp = rand(60, 210);
+    sparkles.push({
+      x: x, y: y,
+      vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 40,
+      life: rand(0.28, 0.5), max: 0.5,
+      r: rand(1.5, 3.4),
+      color: Math.random() < 0.5 ? "#ffffff" : "#ffd85e"
+    });
+  }
+  rings.push({ x: x, y: y, r: 10, life: 0.36, max: 0.36 });
+}
+
+/* ---------------------------------------------------------------- 输入 */
+const keys = Object.create(null);
+
+addEventListener("keydown", function (e) {
+  if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", " "].indexOf(e.key) >= 0) {
+    e.preventDefault();                // 阻止页面滚动
+  }
+  keys[e.key] = true;
+  /* 空格 / 回车也能开始或重开 */
+  if ((e.key === " " || e.key === "Enter") && state !== STATE.PLAY) {
+    resetGame(); state = STATE.PLAY;
+  }
+});
+addEventListener("keyup", function (e) { keys[e.key] = false; });
+
+/* 鼠标点击：开始页与结束页的按钮（需按画布缩放比换算坐标） */
+canvas.addEventListener("click", function (e) {
+  const rect = canvas.getBoundingClientRect();
+  const mx = (e.clientX - rect.left) * (W / rect.width);
+  const my = (e.clientY - rect.top)  * (H / rect.height);
+
+  if (state === STATE.START && inBtn(startBtn, mx, my)) {
+    resetGame(); state = STATE.PLAY;
+  } else if (state === STATE.OVER && inBtn(againBtn, mx, my)) {
+    resetGame(); state = STATE.PLAY;
+  }
+});
+function inBtn(b, x, y) {
+  return x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h;
+}
+
+/* ---------------------------------------------------------------- 更新逻辑 */
+function update(dt) {
+  /* 雪花永远在飘（开始页 / 结束页也飘，营造冬日氛围） */
+  for (let i = 0; i < flakes.length; i++) {
+    const f = flakes[i];
+    f.y += f.vy * dt;
+    f.phase += dt * 1.6;
+    f.x += Math.sin(f.phase) * f.sway * dt * 12;
+    if (f.y > H + 6) { f.y = -6; f.x = rand(0, W); }
+  }
+
+  /* 结束页抖动计时（任何状态下都要递减） */
+  overShakeTime = Math.max(0, overShakeTime - dt);
+  shakeTime     = Math.max(0, shakeTime - dt);   // 否则因撞冰结束时会永远抖动
+
+  if (state !== STATE.PLAY) return;
+
+  playTime  += dt;
+  timeLeft   = Math.max(0, TOTAL_TIME - playTime);
+  sled.invuln = Math.max(0, sled.invuln - dt);
+
+  /* ---- 雪橇横向移动，并限制在画布边界内 ---- */
+  let dir = 0;
+  if (keys["ArrowLeft"])  dir -= 1;
+  if (keys["ArrowRight"]) dir += 1;
+  sled.x = clamp(sled.x + dir * sled.speed * dt, sled.w / 2 + 6, W - sled.w / 2 - 6);
+
+  /* ---- 按节奏生成掉落物（间隔随时间略微缩短） ---- */
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) {
+    spawnDrop();
+    spawnTimer = clamp(rand(0.42, 0.72) - playTime * 0.004, 0.24, 0.8);
+  }
+
+  /* ---- 礼盒：下落 + 接住判定 ---- */
+  const box = { x: sled.x - sled.w / 2, y: SLED_TOP, w: sled.w, h: sled.h };
+  for (let i = gifts.length - 1; i >= 0; i--) {
+    const g = gifts[i];
+    g.y += g.vy * dt;
+    g.wob += dt * 3;
+    if (hit(g, box)) {
+      score += 10;                     // 接住礼盒 +10 分
+      burst(g.x + g.w / 2, g.y + g.h / 2);
+      gifts.splice(i, 1);
+    } else if (g.y > H + 40) {
+      gifts.splice(i, 1);              // 漏接不扣分，只移除
+    }
+  }
+
+  /* ---- 冰块：下落 + 撞击判定 ---- */
+  for (let i = ices.length - 1; i >= 0; i--) {
+    const p = ices[i];
+    p.y += p.vy * dt;
+    if (p.y > H + 40) { ices.splice(i, 1); continue; }
+    if (sled.invuln <= 0 && hit(p, box)) {
+      lives -= 1;                      // 撞到冰块 -1 生命
+      sled.invuln = 0.9;               // 短暂无敌，避免一次撞多个连扣
+      shakeTime = SHAKE_DUR;           // 触发抖动特效
+      ices.splice(i, 1);
+      if (lives <= 0) { endGame(); return; }
+    }
+  }
+
+  /* ---- 特效粒子 ---- */
+  for (let i = sparkles.length - 1; i >= 0; i--) {
+    const s = sparkles[i];
+    s.life -= dt;
+    s.x += s.vx * dt;
+    s.y += s.vy * dt;
+    s.vy += 260 * dt;                  // 轻微下坠
+    if (s.life <= 0) sparkles.splice(i, 1);
+  }
+  for (let i = rings.length - 1; i >= 0; i--) {
+    rings[i].life -= dt;
+    if (rings[i].life <= 0) rings.splice(i, 1);
+  }
+
+  /* ---- 时间到，结束 ---- */
+  if (timeLeft <= 0) endGame();
+}
+
+function endGame() {
+  state = STATE.OVER;
+  overShakeTime = OVER_SHAKE_DUR;   // 结束页抖动 3 秒后静止
+}
+
+/* ---------------------------------------------------------------- 绘制部分 */
+/* 冬日背景：渐变天空 + 远山 + 雪地 + 松树（全部矢量绘制） */
+function drawBackground() {
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0,    "#a8d8f0");
+  sky.addColorStop(0.55, "#cfe9f7");
+  sky.addColorStop(1,    "#eef8ff");
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, H);
+
+  /* 远处两座雪坡 */
+  ctx.fillStyle = "#e4f2fb";
+  ctx.beginPath();
+  ctx.moveTo(-40, GROUND_Y);
+  ctx.quadraticCurveTo(W * 0.22, GROUND_Y - 130, W * 0.48, GROUND_Y);
+  ctx.closePath(); ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(W * 0.46, GROUND_Y);
+  ctx.quadraticCurveTo(W * 0.78, GROUND_Y - 100, W + 40, GROUND_Y);
+  ctx.closePath(); ctx.fill();
+
+  /* 几棵卡通松树 */
+  drawTree(120, GROUND_Y - 4, 0.9);
+  drawTree(230, GROUND_Y - 2, 0.62);
+  drawTree(830, GROUND_Y - 4, 0.8);
+  drawTree(720, GROUND_Y - 2, 0.55);
+
+  /* 雪地 */
+  ctx.fillStyle = "#ffffff";
+  ctx.beginPath();
+  ctx.moveTo(0, GROUND_Y + 6);
+  ctx.quadraticCurveTo(W * 0.3, GROUND_Y - 8, W * 0.55, GROUND_Y + 4);
+  ctx.quadraticCurveTo(W * 0.8, GROUND_Y + 14, W, GROUND_Y + 2);
+  ctx.lineTo(W, H); ctx.lineTo(0, H);
+  ctx.closePath(); ctx.fill();
+}
+
+/* 卡通松树：三层三角形 + 树干 + 积雪 */
+function drawTree(x, baseY, s) {
+  ctx.save();
+  ctx.translate(x, baseY);
+  ctx.scale(s, s);
+  ctx.fillStyle = "#a9714b";
+  ctx.fillRect(-7, -22, 14, 24);
+  const green = ["#3f9e6d", "#48b07c", "#57c48c"];
+  for (let i = 0; i < 3; i++) {
+    const w = 46 - i * 10, top = -20 - i * 30;
+    ctx.fillStyle = green[i];
+    ctx.beginPath();
+    ctx.moveTo(0, top - 34);
+    ctx.lineTo(w, top);
+    ctx.lineTo(-w, top);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.fillStyle = "rgba(255,255,255,.85)";
+  ctx.beginPath(); ctx.ellipse(-14, -50, 13, 5, -0.3, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(16, -80, 11, 4.5, 0.3, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+/* 背景雪花：小片画圆，大片画六角星芒 */
+function drawSnow() {
+  for (let i = 0; i < flakes.length; i++) {
+    const f = flakes[i];
+    ctx.globalAlpha = f.alpha;
+    ctx.fillStyle = "#ffffff";
+    if (f.r < 2.1) {
+      ctx.beginPath(); ctx.arc(f.x, f.y, f.r, 0, Math.PI * 2); ctx.fill();
+    } else {
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      for (let k = 0; k < 6; k++) {
+        const a = k * Math.PI / 3;
+        ctx.moveTo(f.x, f.y);
+        ctx.lineTo(f.x + Math.cos(a) * f.r * 2.4, f.y + Math.sin(a) * f.r * 2.4);
+      }
+      ctx.stroke();
+      ctx.beginPath(); ctx.arc(f.x, f.y, f.r * 0.7, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* 可爱雪橇：红色橇身 + 上翘橇头 + 滑刃 + 白色毛边 */
+function drawSled() {
+  const cx = sled.x, bodyY = SLED_TOP, w = sled.w, h = sled.h;
+
+  ctx.save();
+  /* 受击无敌期间闪烁，提示玩家处于保护状态 */
+  if (sled.invuln > 0 && Math.floor(sled.invuln * 14) % 2 === 0) ctx.globalAlpha = 0.4;
+
+  /* 阴影 */
+  ctx.fillStyle = "rgba(120,160,190,.25)";
+  ctx.beginPath();
+  ctx.ellipse(cx, GROUND_Y + 6, w * 0.58, 8, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  /* 滑刃（前端上翘的深棕曲线） */
+  ctx.strokeStyle = "#7a4a2b";
+  ctx.lineWidth = 5;
+  ctx.lineCap = "round";
+  for (let j = 0; j < 2; j++) {
+    const dx = (j === 0) ? -w * 0.36 : w * 0.36;
+    ctx.beginPath();
+    ctx.moveTo(cx + dx - 16, bodyY + h + 12);
+    ctx.quadraticCurveTo(cx + dx - 16, bodyY + h + 20, cx + dx - 6, bodyY + h + 21);
+    ctx.lineTo(cx + dx + 22, bodyY + h + 21);
+    ctx.stroke();
+  }
+
+  /* 雪橇主体 */
+  ctx.fillStyle = "#e94f4f";
+  rr(ctx, cx - w / 2, bodyY, w, h, 12);
+  ctx.fill();
+  /* 前端上翘的雪橇头 */
+  ctx.beginPath();
+  ctx.moveTo(cx + w / 2 - 4, bodyY + h);
+  ctx.quadraticCurveTo(cx + w / 2 + 22, bodyY + h + 2, cx + w / 2 + 16, bodyY - 8);
+  ctx.quadraticCurveTo(cx + w / 2 + 10, bodyY - 16, cx + w / 2 + 2, bodyY - 12);
+  ctx.quadraticCurveTo(cx + w / 2 + 6, bodyY + 2, cx + w / 2 - 12, bodyY + 6);
+  ctx.closePath();
+  ctx.fill();
+
+  /* 白色毛绒边 */
+  ctx.fillStyle = "#ffffff";
+  rr(ctx, cx - w / 2, bodyY - 5, w, 12, 6);
+  ctx.fill();
+  for (let i = 0; i < 9; i++) {
+    ctx.beginPath();
+    ctx.arc(cx - w / 2 + 8 + i * (w - 16) / 8, bodyY - 5, 5.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  /* 金色缎带与雪花装饰 */
+  ctx.fillStyle = "#ffd85e";
+  rr(ctx, cx - 6, bodyY + 6, 12, h - 8, 4);
+  ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,.9)";
+  ctx.beginPath(); ctx.arc(cx - w / 2 + 22, bodyY + 26, 3.4, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx - w / 2 + 36, bodyY + 22, 2.4, 0, Math.PI * 2); ctx.fill();
+
+  ctx.restore();
+}
+
+/* 礼盒：红/绿盒身 + 金色十字缎带 + 蝴蝶结 */
+function drawGift(g) {
+  const cx = g.x + g.w / 2, cy = g.y + g.h / 2;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(Math.sin(g.wob) * 0.09);
+
+  const w = g.w, h = g.h;
+  ctx.fillStyle = "rgba(90,130,160,.18)";
+  rr(ctx, -w / 2 + 3, -h / 2 + 4, w, h, 5); ctx.fill();
+
+  ctx.fillStyle = g.red ? "#e8433f" : "#2fae5f";
+  rr(ctx, -w / 2, -h / 2, w, h, 5);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,.75)";
+  ctx.lineWidth = 2;
+  rr(ctx, -w / 2, -h / 2, w, h, 5);
+  ctx.stroke();
+
+  ctx.fillStyle = "#ffd257";
+  ctx.fillRect(-w / 2, -3.5, w, 7);
+  ctx.fillRect(-3.5, -h / 2, 7, h);
+
+  ctx.strokeStyle = "#ffd257";
+  ctx.lineWidth = 3.4;
+  ctx.beginPath(); ctx.ellipse(-6, -h / 2 - 5, 7, 4.6, -0.5, 0, Math.PI * 2); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse( 6, -h / 2 - 5, 7, 4.6,  0.5, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = "#ffc23d";
+  ctx.beginPath(); ctx.arc(0, -h / 2 - 4, 3.6, 0, Math.PI * 2); ctx.fill();
+
+  ctx.fillStyle = "rgba(255,255,255,.35)";
+  rr(ctx, -w / 2 + 4, -h / 2 + 4, 9, h - 12, 4);
+  ctx.fill();
+  ctx.restore();
+}
+
+/* 冰块：半透明淡青色圆角方块 + 冰面高光 */
+function drawIce(p) {
+  ctx.save();
+  ctx.translate(p.x + p.w / 2, p.y + p.h / 2);
+  ctx.rotate(p.rot);
+
+  ctx.fillStyle = "rgba(150,222,240,0.55)";
+  rr(ctx, -p.w / 2, -p.h / 2, p.w, p.h, 8); ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,.8)";
+  ctx.lineWidth = 2;
+  rr(ctx, -p.w / 2, -p.h / 2, p.w, p.h, 8); ctx.stroke();
+
+  ctx.strokeStyle = "rgba(255,255,255,.75)";
+  ctx.lineWidth = 3;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(-p.w * 0.22, -p.h * 0.10);
+  ctx.lineTo(p.w * 0.06, -p.h * 0.34);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(p.w * 0.14, p.h * 0.24);
+  ctx.lineTo(p.w * 0.30, p.h * 0.10);
+  ctx.stroke();
+
+  ctx.fillStyle = "rgba(255,255,255,.6)";
+  ctx.beginPath(); ctx.arc(-p.w * 0.24, p.h * 0.26, 2.6, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+/* 接住礼物的闪光特效 */
+function drawEffects() {
+  for (let i = 0; i < rings.length; i++) {
+    const r = rings[i], t = 1 - r.life / r.max;
+    ctx.globalAlpha = (1 - t) * 0.85;
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 4 * (1 - t) + 1;
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, r.r + t * 40, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  for (let i = 0; i < sparkles.length; i++) {
+    const s = sparkles[i];
+    ctx.globalAlpha = clamp(s.life / s.max, 0, 1);
+    ctx.fillStyle = s.color;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* 一颗小爱心（生命值图标） */
+function heart(c, x, y, s, color) {
+  c.save();
+  c.translate(x, y);
+  c.scale(s, s);
+  c.fillStyle = color;
+  c.beginPath();
+  c.moveTo(0, 4);
+  c.bezierCurveTo(-7, -3, -4, -9, 0, -5);
+  c.bezierCurveTo(4, -9, 7, -3, 0, 4);
+  c.closePath();
+  c.fill();
+  c.restore();
+}
+
+/* 左上角 HUD：剩余时间 / 当前分数 / 剩余生命 */
+function drawHUD() {
+  ctx.save();
+  ctx.fillStyle = "rgba(255,255,255,.82)";
+  rr(ctx, 16, 16, 240, 92, 14);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(120,170,205,.55)";
+  ctx.lineWidth = 2;
+  rr(ctx, 16, 16, 240, 92, 14);
+  ctx.stroke();
+
+  ctx.fillStyle = "#2c5a7a";
+  ctx.font = "bold 18px 'Microsoft YaHei', sans-serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+
+  ctx.fillText("剩余时间  " + timeLeft.toFixed(1) + " s", 34, 40);
+  ctx.fillText("当前分数  " + score, 34, 66);
+  ctx.fillText("剩余生命", 34, 92);
+  for (let i = 0; i < 3; i++) {
+    heart(ctx, 140 + i * 26, 92, 1.15, i < lives ? "#ef4444" : "#d5e2ea");
+  }
+  ctx.restore();
+}
+
+/* 通用按钮 */
+function drawButton(b, text) {
+  ctx.save();
+  const g = ctx.createLinearGradient(b.x, b.y, b.x, b.y + b.h);
+  g.addColorStop(0, "#4a9edb");
+  g.addColorStop(1, "#2f7fc0");
+  ctx.fillStyle = g;
+  rr(ctx, b.x, b.y, b.w, b.h, 32);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,.85)";
+  ctx.lineWidth = 3;
+  rr(ctx, b.x, b.y, b.w, b.h, 32);
+  ctx.stroke();
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 26px 'Microsoft YaHei', sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, b.x + b.w / 2, b.y + b.h / 2 + 1);
+  ctx.restore();
+}
+
+/* 开始页面：冬日背景 + 标题 + “点击开始游戏” */
+function drawStart() {
+  ctx.fillStyle = "rgba(255,255,255,.74)";
+  rr(ctx, W / 2 - 260, 140, 520, 340, 26);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(120,170,205,.6)";
+  ctx.lineWidth = 3;
+  rr(ctx, W / 2 - 260, 140, 520, 340, 26);
+  ctx.stroke();
+
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#2c5a7a";
+  ctx.font = "bold 54px 'Microsoft YaHei', sans-serif";
+  ctx.fillText("雪花接礼物", W / 2, 218);
+
+  ctx.fillStyle = "#5b86a6";
+  ctx.font = "18px 'Microsoft YaHei', sans-serif";
+  ctx.fillText("← →  方向键左右移动雪橇", W / 2, 272);
+  ctx.fillText("接住礼盒 +10 分，撞到冰块 -1 生命", W / 2, 302);
+  ctx.fillText("限时 60 秒，生命归零则提前结束", W / 2, 332);
+
+  drawButton(startBtn, "点击开始游戏");
+}
+
+/* 结束页面：总分 + 评价 + 重新开始按钮 */
+function drawOver() {
+  ctx.fillStyle = "rgba(40,70,95,.45)";
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.fillStyle = "rgba(255,255,255,.94)";
+  rr(ctx, W / 2 - 240, 150, 480, 360, 26);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(120,170,205,.6)";
+  ctx.lineWidth = 3;
+  rr(ctx, W / 2 - 240, 150, 480, 360, 26);
+  ctx.stroke();
+
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#2c5a7a";
+  ctx.font = "bold 44px 'Microsoft YaHei', sans-serif";
+  ctx.fillText("游戏结束", W / 2, 218);
+
+  ctx.font = "22px 'Microsoft YaHei', sans-serif";
+  ctx.fillStyle = "#5b86a6";
+  ctx.fillText("最终得分", W / 2, 268);
+
+  ctx.fillStyle = "#e8433f";
+  ctx.font = "bold 64px 'Microsoft YaHei', sans-serif";
+  ctx.fillText(score, W / 2, 322);
+
+  /* 简单的分数评价 */
+  let tip = "再接再厉！";
+  if (score >= 600)      tip = "礼物大师！";
+  else if (score >= 400) tip = "身手矫健！";
+  else if (score >= 200) tip = "渐入佳境～";
+  ctx.fillStyle = "#48b07c";
+  ctx.font = "bold 24px 'Microsoft YaHei', sans-serif";
+  ctx.fillText(tip, W / 2, 366);
+
+  drawButton(againBtn, "重新开始");
+}
+
+/* ---------------------------------------------------------------- 主循环 */
+let lastTime = 0;
+
+function frame(now) {
+  /* 用真实时间差计算 dt，保证不同刷新率下速度一致 */
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  if (!(dt > 0) || dt > 0.05) dt = 0.016;   // 切后台回来时防跳变
+
+  update(dt);
+
+  /* 抖动特效：撞冰抖 0.32s；游戏结束页持续抖 3s，幅度随时间衰减 */
+  ctx.save();
+  let sh = 0;
+  if (shakeTime > 0) {
+    sh = shakeTime / SHAKE_DUR;
+  } else if (state === STATE.OVER && overShakeTime > 0) {
+    sh = overShakeTime / OVER_SHAKE_DUR;
+  }
+  if (sh > 0) {
+    ctx.translate(rand(-1, 1) * 11 * sh, rand(-1, 1) * 11 * sh);
+  }
+
+  drawBackground();
+  drawSnow();
+  for (let i = 0; i < gifts.length; i++) drawGift(gifts[i]);
+  for (let i = 0; i < ices.length; i++)  drawIce(ices[i]);
+  if (state === STATE.PLAY) drawSled();
+  drawEffects();
+
+  if (state === STATE.PLAY) drawHUD();
+  else if (state === STATE.START) drawStart();
+  else drawOver();
+
+  ctx.restore();
+  requestAnimationFrame(frame);
+}
+
+/* ---------------------------------------------------------------- 启动 */
+initSnow();
+resetGame();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
